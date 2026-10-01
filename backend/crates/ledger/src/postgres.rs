@@ -16,17 +16,6 @@ use engipay_core::{Asset, Money, UserId};
 
 use crate::{ActiveHold, Balance, HoldState, LedgerError, Receipt};
 
-/// One active (open) hold belonging to a user, returned by [`PostgresLedgerStore::get_active_holds`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveHold {
-    pub reference: String,
-    pub asset: Asset,
-    /// Amount in the asset's smallest unit (same precision as the ledger).
-    pub amount: i128,
-    /// RFC 3339 timestamp of when the hold was created.
-    pub created_at: String,
-}
-
 // ── Constants ──────────────────────────────────────────────────────────
 
 const MAX_RETRIES: u32 = 3;
@@ -96,9 +85,6 @@ impl PostgresLedgerStore {
             .collect())
     }
 
-    /// Returns all open (in-flight) holds for `user`, ordered by creation
-    /// time ascending.  Only holds in the `open` state are returned; released
-    /// and settled holds are not included.
     /// All open (active) holds for `user`, ordered by creation time ascending.
     ///
     /// Returns an empty `Vec` when the user has no open holds.  Each entry
@@ -142,29 +128,6 @@ impl PostgresLedgerStore {
                 })
             })
             .collect()
-        let mut holds = Vec::with_capacity(rows.len());
-        for row in rows {
-            let reference: String = row.get("reference");
-            let asset_str: String = row.get("asset");
-            let amount_str: String = row.get("amount");
-            let created_at: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc> =
-                row.get("created_at");
-
-            let asset = asset_str.parse::<Asset>().map_err(|_| LedgerError::Database {
-                code: None,
-                message: format!("unknown asset in ledger_holds: {asset_str}"),
-            })?;
-            let amount = amount_str.parse::<i128>().map_err(|_| LedgerError::Overflow)?;
-
-            holds.push(ActiveHold {
-                reference,
-                asset,
-                amount,
-                created_at: created_at.to_rfc3339(),
-            });
-        }
-
-        Ok(holds)
     }
 
     /// Credits a user with money that arrived from outside EngiPay.
@@ -590,7 +553,12 @@ async fn get_hold(
     reference: &str,
 ) -> Result<Hold, LedgerError> {
     let row =
-        sqlx::query("SELECT user_id, asset, amount, state FROM ledger_holds WHERE reference = $1")
+        // `amount` is NUMERIC; cast to text so it is decoded as an exact integer
+        // string and parsed with i128 below (never a float).
+        sqlx::query(
+            "SELECT user_id, asset, amount::text AS amount, state \
+             FROM ledger_holds WHERE reference = $1",
+        )
             .bind(reference)
             .fetch_optional(&mut **tx)
             .await
@@ -837,10 +805,14 @@ mod tests {
     async fn deposit_credits_user_available_balance() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
-        let receipt = store.deposit(alice, usdc(100), "dep-1").await.unwrap();
+        let receipt = store
+            .deposit(alice, usdc(100), &format!("dep-1-{suffix}"))
+            .await
+            .unwrap();
         assert!(!receipt.replayed);
 
         let available = get_user_balance_from_pool(&pool, alice, Asset::Usdc, "available").await;
@@ -854,15 +826,16 @@ mod tests {
     async fn get_user_balances_reports_every_asset_zero_filled() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
         store
-            .deposit(alice, usdc(250), "balances-dep-1")
+            .deposit(alice, usdc(250), &format!("balances-dep-1-{suffix}"))
             .await
             .unwrap();
         store
-            .create_hold(alice, usdc(60), "balances-hold-1")
+            .create_hold(alice, usdc(60), &format!("balances-hold-1-{suffix}"))
             .await
             .unwrap();
 
@@ -884,11 +857,18 @@ mod tests {
     async fn deposit_replay_returns_same_receipt() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
-        let first = store.deposit(alice, usdc(50), "dep-replay").await.unwrap();
-        let second = store.deposit(alice, usdc(50), "dep-replay").await.unwrap();
+        let first = store
+            .deposit(alice, usdc(50), &format!("dep-replay-{suffix}"))
+            .await
+            .unwrap();
+        let second = store
+            .deposit(alice, usdc(50), &format!("dep-replay-{suffix}"))
+            .await
+            .unwrap();
 
         assert!(!first.replayed);
         assert!(second.replayed);
@@ -903,14 +883,17 @@ mod tests {
     async fn deposit_idempotency_conflict() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
         store
-            .deposit(alice, usdc(50), "dep-conflict")
+            .deposit(alice, usdc(50), &format!("dep-conflict-{suffix}"))
             .await
             .unwrap();
-        let result = store.deposit(alice, usdc(99), "dep-conflict").await;
+        let result = store
+            .deposit(alice, usdc(99), &format!("dep-conflict-{suffix}"))
+            .await;
 
         assert!(matches!(
             result,
@@ -925,11 +908,18 @@ mod tests {
     async fn hold_moves_from_available_to_held() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
-        store.deposit(alice, usdc(100), "seed-hold").await.unwrap();
-        let receipt = store.create_hold(alice, usdc(60), "hold-1").await.unwrap();
+        store
+            .deposit(alice, usdc(100), &format!("seed-hold-{suffix}"))
+            .await
+            .unwrap();
+        let receipt = store
+            .create_hold(alice, usdc(60), &format!("hold-1-{suffix}"))
+            .await
+            .unwrap();
         assert!(!receipt.replayed);
 
         let available = get_user_balance_from_pool(&pool, alice, Asset::Usdc, "available").await;
@@ -946,14 +936,17 @@ mod tests {
     async fn hold_insufficient_funds() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
         store
-            .deposit(alice, usdc(100), "seed-hold-insuf")
+            .deposit(alice, usdc(100), &format!("seed-hold-insuf-{suffix}"))
             .await
             .unwrap();
-        let result = store.create_hold(alice, usdc(101), "hold-insuf").await;
+        let result = store
+            .create_hold(alice, usdc(101), &format!("hold-insuf-{suffix}"))
+            .await;
 
         assert!(matches!(result, Err(LedgerError::InsufficientFunds { .. })));
     }
@@ -965,13 +958,17 @@ mod tests {
     async fn transfer_moves_between_users_symmetrically() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let (alice, bob) = (UserId::new(), UserId::new());
         ensure_user(&pool, alice).await;
         ensure_user(&pool, bob).await;
 
-        store.deposit(alice, usdc(100), "seed-xfer").await.unwrap();
+        store
+            .deposit(alice, usdc(100), &format!("seed-xfer-{suffix}"))
+            .await
+            .unwrap();
         let receipt = store
-            .transfer(alice, bob, usdc(30), "xfer-1")
+            .transfer(alice, bob, usdc(30), &format!("xfer-1-{suffix}"))
             .await
             .unwrap();
         assert!(!receipt.replayed);
@@ -988,15 +985,18 @@ mod tests {
     async fn transfer_insufficient_funds() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let (alice, bob) = (UserId::new(), UserId::new());
         ensure_user(&pool, alice).await;
         ensure_user(&pool, bob).await;
 
         store
-            .deposit(alice, usdc(100), "seed-xfer-insuf")
+            .deposit(alice, usdc(100), &format!("seed-xfer-insuf-{suffix}"))
             .await
             .unwrap();
-        let result = store.transfer(alice, bob, usdc(101), "xfer-insuf").await;
+        let result = store
+            .transfer(alice, bob, usdc(101), &format!("xfer-insuf-{suffix}"))
+            .await;
 
         assert!(matches!(result, Err(LedgerError::InsufficientFunds { .. })));
         // Nothing moved.
@@ -1024,16 +1024,20 @@ mod tests {
     async fn get_active_holds_returns_open_holds_for_user() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
-        store.deposit(alice, usdc(300), "seed-ah-1").await.unwrap();
         store
-            .create_hold(alice, usdc(100), "hold-ah-1")
+            .deposit(alice, usdc(300), &format!("seed-ah-1-{suffix}"))
             .await
             .unwrap();
         store
-            .create_hold(alice, usdc(50), "hold-ah-2")
+            .create_hold(alice, usdc(100), &format!("hold-ah-1-{suffix}"))
+            .await
+            .unwrap();
+        store
+            .create_hold(alice, usdc(50), &format!("hold-ah-2-{suffix}"))
             .await
             .unwrap();
 
@@ -1041,43 +1045,58 @@ mod tests {
         assert_eq!(holds.len(), 2);
 
         let refs: Vec<&str> = holds.iter().map(|h| h.reference.as_str()).collect();
-        assert!(refs.contains(&"hold-ah-1"));
-        assert!(refs.contains(&"hold-ah-2"));
+        assert!(refs.contains(&format!("hold-ah-1-{suffix}").as_str()));
+        assert!(refs.contains(&format!("hold-ah-2-{suffix}").as_str()));
 
-        let h1 = holds.iter().find(|h| h.reference == "hold-ah-1").unwrap();
+        let h1 = holds
+            .iter()
+            .find(|h| h.reference == format!("hold-ah-1-{suffix}"))
+            .unwrap();
         assert_eq!(h1.asset, Asset::Usdc);
         assert_eq!(h1.amount, 100);
-        assert!(h1.created_at.contains('T'), "created_at should be RFC 3339");
+        assert!(
+            h1.created_at.to_rfc3339().contains('T'),
+            "created_at should be RFC 3339"
+        );
     }
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL"]
     async fn get_active_holds_excludes_released_holds() {
+        // Ledger references are globally unique, so each run needs its own
+        // suffix: a shared DATABASE_URL would otherwise replay a previous run.
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
-        store.deposit(alice, usdc(300), "seed-ah-excl").await.unwrap();
         store
-            .create_hold(alice, usdc(100), "hold-excl-open")
+            .deposit(alice, usdc(300), &format!("seed-ah-excl-{suffix}"))
             .await
             .unwrap();
         store
-            .create_hold(alice, usdc(50), "hold-excl-released")
+            .create_hold(alice, usdc(100), &format!("hold-excl-open-{suffix}"))
             .await
             .unwrap();
-        store.release_hold("hold-excl-released").await.unwrap();
+        store
+            .create_hold(alice, usdc(50), &format!("hold-excl-released-{suffix}"))
+            .await
+            .unwrap();
+        store
+            .release_hold(&format!("hold-excl-released-{suffix}"))
+            .await
+            .unwrap();
 
         let holds = store.get_active_holds(alice).await.unwrap();
         let open_refs: Vec<&str> = holds.iter().map(|h| h.reference.as_str()).collect();
 
         assert!(
-            open_refs.contains(&"hold-excl-open"),
+            open_refs.contains(&format!("hold-excl-open-{suffix}").as_str()),
             "open hold must appear"
         );
         assert!(
-            !open_refs.contains(&"hold-excl-released"),
+            !open_refs.contains(&format!("hold-excl-released-{suffix}").as_str()),
             "released hold must not appear"
         );
         assert_eq!(holds.len(), 1);
@@ -1102,19 +1121,23 @@ mod tests {
     async fn release_hold_returns_money_to_available() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
         store
-            .deposit(alice, usdc(100), "seed-release")
+            .deposit(alice, usdc(100), &format!("seed-release-{suffix}"))
             .await
             .unwrap();
         store
-            .create_hold(alice, usdc(60), "hold-release")
+            .create_hold(alice, usdc(60), &format!("hold-release-{suffix}"))
             .await
             .unwrap();
 
-        let receipt = store.release_hold("hold-release").await.unwrap();
+        let receipt = store
+            .release_hold(&format!("hold-release-{suffix}"))
+            .await
+            .unwrap();
         assert!(!receipt.replayed);
 
         let available = get_user_balance_from_pool(&pool, alice, Asset::Usdc, "available").await;
@@ -1129,20 +1152,27 @@ mod tests {
     async fn release_hold_replay_returns_same_receipt() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
         store
-            .deposit(alice, usdc(100), "seed-release-replay")
+            .deposit(alice, usdc(100), &format!("seed-release-replay-{suffix}"))
             .await
             .unwrap();
         store
-            .create_hold(alice, usdc(60), "hold-release-replay")
+            .create_hold(alice, usdc(60), &format!("hold-release-replay-{suffix}"))
             .await
             .unwrap();
 
-        let first = store.release_hold("hold-release-replay").await.unwrap();
-        let second = store.release_hold("hold-release-replay").await.unwrap();
+        let first = store
+            .release_hold(&format!("hold-release-replay-{suffix}"))
+            .await
+            .unwrap();
+        let second = store
+            .release_hold(&format!("hold-release-replay-{suffix}"))
+            .await
+            .unwrap();
 
         assert!(!first.replayed);
         assert!(second.replayed);
@@ -1151,26 +1181,36 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL"]
-    async fn release_hold_on_non_open_hold_fails() {
+    async fn release_hold_on_already_released_hold_replays() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
         store
-            .deposit(alice, usdc(100), "seed-release-closed")
+            .deposit(alice, usdc(100), &format!("seed-release-closed-{suffix}"))
             .await
             .unwrap();
         store
-            .create_hold(alice, usdc(60), "hold-closed")
+            .create_hold(alice, usdc(60), &format!("hold-closed-{suffix}"))
             .await
             .unwrap();
-        store.release_hold("hold-closed").await.unwrap();
+        store
+            .release_hold(&format!("hold-closed-{suffix}"))
+            .await
+            .unwrap();
 
-        // Try to release again
-        let result = store.release_hold("hold-closed").await;
+        // Releasing again is a replay of the same request, not a new one: the
+        // idempotency check runs first and returns the original receipt rather
+        // than an error. (A *different* hold that is genuinely not open still
+        // returns `HoldClosed`; see the `release_hold` unit tests in lib.rs.)
+        let result = store.release_hold(&format!("hold-closed-{suffix}")).await;
 
-        assert!(matches!(result, Err(LedgerError::HoldClosed { .. })));
+        assert!(
+            matches!(result, Ok(receipt) if receipt.replayed),
+            "re-releasing a released hold must replay the original receipt"
+        );
     }
 
     #[tokio::test]
@@ -1178,8 +1218,9 @@ mod tests {
     async fn release_hold_non_existent_hold_fails() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
 
-        let result = store.release_hold("nonexistent").await;
+        let result = store.release_hold(&format!("nonexistent-{suffix}")).await;
 
         assert!(matches!(result, Err(LedgerError::HoldNotFound { .. })));
     }
@@ -1191,11 +1232,17 @@ mod tests {
     async fn deposit_idempotency_detects_fingerprint_mismatch() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let alice = UserId::new();
         ensure_user(&pool, alice).await;
 
-        store.deposit(alice, usdc(50), "fp-conflict").await.unwrap();
-        let result = store.deposit(alice, usdc(99), "fp-conflict").await;
+        store
+            .deposit(alice, usdc(50), &format!("fp-conflict-{suffix}"))
+            .await
+            .unwrap();
+        let result = store
+            .deposit(alice, usdc(99), &format!("fp-conflict-{suffix}"))
+            .await;
 
         assert!(matches!(
             result,
@@ -1208,21 +1255,24 @@ mod tests {
     async fn transfer_idempotency_detects_fingerprint_mismatch() {
         let pool = test_pool().await.unwrap();
         let store = PostgresLedgerStore::new(pool.clone());
+        let suffix = Uuid::new_v4().to_string();
         let (alice, bob, charlie) = (UserId::new(), UserId::new(), UserId::new());
         ensure_user(&pool, alice).await;
         ensure_user(&pool, bob).await;
         ensure_user(&pool, charlie).await;
 
         store
-            .deposit(alice, usdc(100), "seed-xfer-fp")
+            .deposit(alice, usdc(100), &format!("seed-xfer-fp-{suffix}"))
             .await
             .unwrap();
         store
-            .transfer(alice, bob, usdc(30), "xfer-fp")
+            .transfer(alice, bob, usdc(30), &format!("xfer-fp-{suffix}"))
             .await
             .unwrap();
 
-        let result = store.transfer(alice, charlie, usdc(30), "xfer-fp").await;
+        let result = store
+            .transfer(alice, charlie, usdc(30), &format!("xfer-fp-{suffix}"))
+            .await;
 
         assert!(matches!(
             result,

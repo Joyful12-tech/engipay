@@ -223,7 +223,13 @@ pub fn deposit_from_record(
         Some("credit_alphanum4") | Some("credit_alphanum12") => {
             let code = record.asset_code.clone().unwrap_or_default();
             let issuer = record.asset_issuer.clone().unwrap_or_default();
-            if code == "USDC" && issuer == network.usdc_issuer() {
+            // Circle's real USDC is always `credit_alphanum4`. A token named
+            // "USDC" that is `alphanum12` is a different asset that can borrow
+            // Circle's issuer address, so it must never be credited as USDC.
+            let genuine_usdc = code == "USDC"
+                && issuer == network.usdc_issuer()
+                && record.asset_type.as_deref() == Some("credit_alphanum4");
+            if genuine_usdc {
                 Asset::Usdc
             } else {
                 // Flag tokens named "USDC" from the wrong issuer separately so
@@ -624,6 +630,7 @@ mod tests {
         let unsupported = Skipped::UnsupportedAsset {
             code: "FAKE".to_owned(),
             issuer: "GXXXX".to_owned(),
+            counterfeit_usdc: false,
         };
         assert!(unsupported.is_security_sensitive());
 
@@ -736,7 +743,10 @@ mod tests {
             },
         );
 
-        assert!(cache.get("stale").is_none(), "expired entry must not be returned");
+        assert!(
+            cache.get("stale").is_none(),
+            "expired entry must not be returned"
+        );
     }
 
     #[test]

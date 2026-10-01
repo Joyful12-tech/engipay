@@ -1,12 +1,13 @@
+use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 
 /// Token bucket state for rate limiting
 #[derive(Clone, Debug)]
@@ -26,25 +27,36 @@ impl RateLimiter {
     pub fn new() -> Self {
         RateLimiter {
             buckets: Arc::new(RwLock::new(HashMap::new())),
-            public_rate: 60.0 / 60.0,
-            auth_rate: 120.0 / 60.0,
+            // Requests allowed per second, and per minute for authenticated callers.
+            public_rate: 1.0,
+            auth_rate: 2.0,
         }
     }
 
-    pub async fn check_rate_limit(&self, ip: &str, is_authenticated: bool) -> Result<(), (StatusCode, String)> {
+    pub async fn check_rate_limit(
+        &self,
+        ip: &str,
+        is_authenticated: bool,
+    ) -> Result<(), (StatusCode, String)> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
         let mut buckets = self.buckets.write().await;
-        let rate = if is_authenticated { self.auth_rate } else { self.public_rate };
+        let rate = if is_authenticated {
+            self.auth_rate
+        } else {
+            self.public_rate
+        };
         let max_tokens = if is_authenticated { 120.0 } else { 60.0 };
 
-        let bucket = buckets.entry(ip.to_string()).or_insert_with(|| TokenBucket {
-            tokens: max_tokens,
-            last_refill: now,
-        });
+        let bucket = buckets
+            .entry(ip.to_string())
+            .or_insert_with(|| TokenBucket {
+                tokens: max_tokens,
+                last_refill: now,
+            });
 
         let elapsed = (now - bucket.last_refill) as f64;
         let new_tokens = (bucket.tokens + elapsed * rate).min(max_tokens);
@@ -71,9 +83,9 @@ impl Default for RateLimiter {
 }
 
 /// Rate limiting middleware for global IP-based rate limiting
-pub async fn rate_limit_middleware<B>(
+pub async fn rate_limit_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    req: Request<B>,
+    req: Request<Body>,
     next: Next,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let ip = addr.ip().to_string();
@@ -109,10 +121,12 @@ impl VelocityLimiter {
         let rate = 5.0 / 60.0;
         let max_tokens = 5.0;
 
-        let bucket = buckets.entry(user_id.to_string()).or_insert_with(|| TokenBucket {
-            tokens: max_tokens,
-            last_refill: now,
-        });
+        let bucket = buckets
+            .entry(user_id.to_string())
+            .or_insert_with(|| TokenBucket {
+                tokens: max_tokens,
+                last_refill: now,
+            });
 
         let elapsed = (now - bucket.last_refill) as f64;
         let new_tokens = (bucket.tokens + elapsed * rate).min(max_tokens);
@@ -121,7 +135,10 @@ impl VelocityLimiter {
             let retry_after = ((1.0 - new_tokens) / rate).ceil() as u64;
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("Too many requests. Maximum 5 transfers per minute. Retry-After: {}", retry_after),
+                format!(
+                    "Too many requests. Maximum 5 transfers per minute. Retry-After: {}",
+                    retry_after
+                ),
             ));
         }
 
@@ -140,7 +157,6 @@ impl Default for VelocityLimiter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     // Tests skipped as per user request
 }

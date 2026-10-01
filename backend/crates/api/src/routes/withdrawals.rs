@@ -17,7 +17,7 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/withdrawals", post(create_withdrawal))
-        .route("/withdrawals/:id", get(get_withdrawal))
+        .route("/withdrawals/{id}", get(get_withdrawal))
 }
 
 #[derive(Debug, Deserialize)]

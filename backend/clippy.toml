@@ -1,0 +1,5 @@
+# `unwrap`/`expect` are fine in `#[cfg(test)]` code: a panic there *is* the
+# assertion failing, which is exactly what a test should do. Production code
+# remains held to `unwrap_used = "warn"` from the workspace lints.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

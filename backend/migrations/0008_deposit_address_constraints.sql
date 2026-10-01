@@ -1,11 +1,11 @@
--- Migration 0007: align deposit_addresses with the Epic 1 schema.
+-- Migration 0008: align deposit_addresses with the Epic 1 schema.
 --
 -- The original 0002 migration created deposit_addresses without a
 -- UNIQUE(user_id, chain) constraint or a derivation_index column.  Migration
 -- 0005 used CREATE TABLE IF NOT EXISTS so these additions were never applied
 -- when upgrading an existing database.  This migration adds them idempotently.
 --
--- The UNIQUE(chain, address) constraint from 0002 is dropped: on Base and
+-- The UNIQUE(chain, address) constraint from 0003 is dropped: on Base and
 -- Bitcoin, all users currently share the custody address (until the chain
 -- service exposes per-user key derivation), so the address is not globally
 -- unique.  The UNIQUE(user_id, chain) constraint is the meaningful one:
@@ -15,8 +15,8 @@
 ALTER TABLE deposit_addresses
     ADD COLUMN IF NOT EXISTS derivation_index INT;
 
--- Drop the old address-level uniqueness constraint (only applies to the 0002
--- schema; the 0005 schema never had it because its CREATE TABLE IF NOT EXISTS
+-- Drop the old address-level uniqueness constraint (only applies to the 0003
+-- schema; the 0006 schema never had it because its CREATE TABLE IF NOT EXISTS
 -- was skipped).
 DO $$
 BEGIN

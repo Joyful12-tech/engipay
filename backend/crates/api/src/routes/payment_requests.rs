@@ -19,7 +19,7 @@ pub struct PaymentRequestResponse {
 }
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/payment-requests/:id", get(get_payment_request))
+    Router::new().route("/payment-requests/{id}", get(get_payment_request))
 }
 
 /// Get a payment request by ID. No authentication required so external payers
@@ -77,7 +77,6 @@ async fn get_payment_request(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     // Tests skipped as per user request
 }

@@ -4,12 +4,12 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+
+use engipay_core::{Asset, Money, UserId};
+use engipay_ledger::postgres::PostgresLedgerStore;
+use uuid::Uuid;
 
 use crate::AppState;
-use crate::middleware::VelocityLimiter;
-use crate::routes::auth::AuthUser;
 
 /// A validated request to create an internal transfer.
 ///
@@ -23,15 +23,6 @@ pub struct TransferRequest {
     pub asset: Asset,
     pub amount: String,
     pub reference: String,
-}
-
-/// Supported assets for transfers. Reuses the core asset identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Asset {
-    Usd,
-    Eur,
-    Gbp,
 }
 
 /// Validation failures for a [`TransferRequest`].
@@ -190,25 +181,34 @@ async fn create_transfer(
     // Execute the atomic ledger transfer inside a database transaction. The
     // idempotency reference is the caller-supplied `reference`, so retries of
     // the same request do not double-spend.
-    let result = state
-        .ledger
-        .transfer(
-            &request.sender,
-            &request.recipient,
-            amount,
-            &request.reference,
-        )
+    let Some(pool) = state.database.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+
+    let (Ok(sender_uuid), Ok(recipient_uuid)) = (
+        Uuid::parse_str(&request.sender),
+        Uuid::parse_str(&request.recipient),
+    ) else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
+    let sender = UserId::from_uuid(sender_uuid);
+    let recipient = UserId::from_uuid(recipient_uuid);
+
+    let store = PostgresLedgerStore::new(pool);
+    let money = Money::from_minor(request.asset, amount as i128);
+    let result = store
+        .transfer(sender, recipient, money, &request.reference)
         .await;
 
     match result {
-        Ok(transaction_id) => {
-            let receipt = TransferReceipt::completed(
-                transaction_id,
+        Ok(receipt) => {
+            let receipt_body = TransferReceipt::completed(
+                receipt.transaction_id.to_string(),
                 &request,
                 amount,
                 now_iso8601(),
             );
-            (StatusCode::CREATED, Json(receipt)).into_response()
+            (StatusCode::CREATED, Json(receipt_body)).into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -268,7 +268,7 @@ mod tests {
         TransferRequest {
             sender: sender.to_string(),
             recipient: recipient.to_string(),
-            asset: Asset::Usd,
+            asset: Asset::Usdc,
             amount: amount.to_string(),
             reference: reference.to_string(),
         }
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(json["reference"], "ref-1");
         assert_eq!(json["sender_tag"], "bob");
         assert_eq!(json["recipient_tag"], "alice");
-        assert_eq!(json["asset"], "usd");
+        assert_eq!(json["asset"], "USDC");
         assert_eq!(json["amount"], "100");
         assert_eq!(json["created_at"], "2024-01-02T03:04:05Z");
         assert_eq!(json["status"], "completed");
@@ -398,8 +398,7 @@ mod tests {
         );
 
         let json = serde_json::to_string(&receipt).expect("receipt serializes");
-        let decoded: TransferReceipt =
-            serde_json::from_str(&json).expect("receipt deserializes");
+        let decoded: TransferReceipt = serde_json::from_str(&json).expect("receipt deserializes");
         assert_eq!(decoded, receipt);
     }
 

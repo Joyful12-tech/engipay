@@ -24,6 +24,7 @@ use std::task::{Context, Poll};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures_util::FutureExt;
 use serde_json::json;
 use tower::{Layer, Service};
 
@@ -76,21 +77,17 @@ where
         // converted to a clean 500 response.
         let future = self.inner.call(req);
 
-        Box::pin(async move {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future))
-                    .map_err(|payload| payload);
+        let inner = std::panic::AssertUnwindSafe(future);
 
-            match result {
-                Ok(inner_future) => {
-                    // The future itself runs; panics *inside* the async fn body
-                    // are caught by tokio's task machinery and surface as
-                    // JoinError — the watcher layer above handles those.
-                    // Here we just drive the normal future.
-                    inner_future.await
-                }
-                Err(panic_payload) => Ok(panic_response(panic_payload)),
-            }
+        Box::pin(async move {
+            // `catch_unwind` has to wrap the *polling* of the inner future, not
+            // just its construction: a panic inside an async fn body fires while
+            // the future is being polled, so wrapping only `call()` lets it
+            // escape. `FutureExt::catch_unwind` polls inside the guard for us.
+            inner
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic_payload| Ok(panic_response(panic_payload)))
         })
     }
 }
@@ -122,10 +119,7 @@ fn panic_response(panic: Box<dyn Any + Send>) -> Response {
 
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/problem+json",
-        )],
+        [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
         axum::Json(body),
     )
         .into_response()
@@ -196,12 +190,7 @@ mod tests {
     #[tokio::test]
     async fn normal_handler_is_not_affected() {
         let response = app()
-            .oneshot(
-                Request::builder()
-                    .uri("/ok")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
