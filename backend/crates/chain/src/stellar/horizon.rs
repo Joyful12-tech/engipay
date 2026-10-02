@@ -143,6 +143,12 @@ impl TransactionCache {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Whether the cache holds no entries at all.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// `400` from `POST /transactions`.
@@ -222,7 +228,13 @@ pub fn deposit_from_record(
         Some("credit_alphanum4") | Some("credit_alphanum12") => {
             let code = record.asset_code.clone().unwrap_or_default();
             let issuer = record.asset_issuer.clone().unwrap_or_default();
-            if code == "USDC" && issuer == network.usdc_issuer() {
+            // Circle's real USDC is a 4-character asset. A 12-character code
+            // padded to "USDC" is a different asset even when it comes from the
+            // same issuer, so the asset type is part of the check.
+            let is_canonical_usdc = code == "USDC"
+                && issuer == network.usdc_issuer()
+                && record.asset_type.as_deref() == Some("credit_alphanum4");
+            if is_canonical_usdc {
                 Asset::Usdc
             } else {
                 // Flag tokens named "USDC" from the wrong issuer separately so
@@ -623,6 +635,7 @@ mod tests {
         let unsupported = Skipped::UnsupportedAsset {
             code: "FAKE".to_owned(),
             issuer: "GXXXX".to_owned(),
+            counterfeit_usdc: false,
         };
         assert!(unsupported.is_security_sensitive());
 
@@ -735,7 +748,10 @@ mod tests {
             },
         );
 
-        assert!(cache.get("stale").is_none(), "expired entry must not be returned");
+        assert!(
+            cache.get("stale").is_none(),
+            "expired entry must not be returned"
+        );
     }
 
     #[test]
